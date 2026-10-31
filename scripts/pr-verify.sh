@@ -25,20 +25,24 @@
 # auth for view/comment only. PR mode pins the head SHA at start-of-run.
 set -u
 
+INVOKED_AS="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LEGS=(hygiene deps typecheck unit-tests build leak-gate)
 
 usage() {
-    echo "usage: $0 <PR-number | git-ref> [--no-post] [--only LEG[,LEG...]] [--remove-logs]" >&2
+    echo "usage: $0 <PR-number | git-ref> [--no-post] [--only LEG[,LEG...]] [--trusted-author LOGIN] [--remove-logs]" >&2
     echo "legs: ${LEGS[*]}" >&2
     exit 2
 }
 die() { echo "pr-verify: $*" >&2; exit 2; }
 
 TARGET=""; NO_POST=0; REMOVE_LOGS=0; ONLY=""
+EXTRA_TRUSTED=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-post) NO_POST=1 ;;
+        --trusted-author) [ $# -ge 2 ] || die "--trusted-author needs a login"; EXTRA_TRUSTED+=("$2"); shift ;;
+        --trusted-author=*) EXTRA_TRUSTED+=("${1#--trusted-author=}") ;;
         --remove-logs) REMOVE_LOGS=1 ;;
         --only) [ $# -ge 2 ] || die "--only needs a comma-separated leg list"; ONLY="$2"; shift ;;
         --only=*) ONLY="${1#--only=}" ;;
@@ -70,11 +74,36 @@ PR_NUMBER=""; PR_TITLE=""; PR_STATE=""; HEAD_REF=""; BASE_SHA=""
 if [[ "$TARGET" =~ ^[0-9]+$ ]]; then
     command -v gh >/dev/null 2>&1 || die "PR mode needs gh (ref: $SLUG)"
     PR_NUMBER="$TARGET"
-    meta="$(gh pr view "$PR_NUMBER" -R "$SLUG" --json title,state,headRefName,headRefOid --jq='[.title,.state,.headRefName,.headRefOid]|@tsv' 2>/dev/null)" \
+    meta="$(gh pr view "$PR_NUMBER" -R "$SLUG" --json title,state,author,headRefName,headRefOid --jq='[.title,.state,.author.login,.headRefName,.headRefOid]|@tsv' 2>/dev/null)" \
         || die "gh pr view $PR_NUMBER failed"
-    IFS=$'\t' read -r PR_TITLE PR_STATE HEAD_REF HEAD_OID <<<"$meta"
+    IFS=$'\t' read -r PR_TITLE PR_STATE PR_AUTHOR HEAD_REF HEAD_OID <<<"$meta"
     [ "$PR_STATE" = "OPEN" ] || die "PR #$PR_NUMBER is $PR_STATE — verify open PRs"
-    git -C "$ROOT" fetch --quiet origin main 2>/dev/null || true
+
+    # Trust gate (#3 P1): PR legs execute the PR's package.json code as the
+    # invoking user. Without isolation infra, verification is restricted to
+    # trusted authors; extend per-run with --trusted-author or
+    # PR_VERIFY_TRUSTED_AUTHORS (comma-separated), or run untrusted PRs in a
+    # container/VM instead of this script.
+    TRUSTED="Amperstrand${PR_VERIFY_TRUSTED_AUTHORS:+,$PR_VERIFY_TRUSTED_AUTHORS}"
+    for a in "${EXTRA_TRUSTED[@]}"; do TRUSTED="$TRUSTED,$a"; done
+    ok=0
+    IFS=',' read -r -a _t <<<"$TRUSTED"
+    for t in "${_t[@]}"; do [ "$t" = "$PR_AUTHOR" ] && ok=1; done
+    [ "$ok" = 1 ] || die "PR #$PR_NUMBER author '$PR_AUTHOR' is not trusted — run legs isolated (container/VM) or pass --trusted-author '$PR_AUTHOR' after review"
+
+    # Fork-safe head fetch (#3 P1): a fork's branch does not exist on the
+    # base origin; refs/pull/N/head always does. The fetched OID must equal
+    # the pinned head — a mismatch means the PR moved mid-run: rerun.
+    git -C "$ROOT" fetch --quiet origin "refs/pull/$PR_NUMBER/head" 2>/dev/null \
+        || die "cannot fetch refs/pull/$PR_NUMBER/head from $SLUG"
+    FETCHED_OID="$(git -C "$ROOT" rev-parse --verify --quiet FETCH_HEAD^{commit})" \
+        || die "refs/pull/$PR_NUMBER/head did not resolve to a commit"
+    [ "$FETCHED_OID" = "$HEAD_OID" ] \
+        || die "head moved during run (pinned ${HEAD_OID:0:10}, fetched ${FETCHED_OID:0:10}) — rerun"
+
+    # Refresh the tracking ref explicitly (#3 P2): `fetch origin main` writes
+    # FETCH_HEAD only and leaves origin/main stale.
+    git -C "$ROOT" fetch --quiet origin +main:refs/remotes/origin/main 2>/dev/null || true
     BASE_SHA="$(git -C "$ROOT" merge-base "$HEAD_OID" origin/main 2>/dev/null || echo '?')"
     echo "== PR #$PR_NUMBER: $PR_TITLE"
     echo "== head $HEAD_REF @ ${HEAD_OID:0:10} (base ${BASE_SHA:0:10})"
@@ -104,13 +133,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
-git -C "$ROOT" fetch --quiet origin "$HEAD_REF" 2>/dev/null || true
+if [ -z "$PR_NUMBER" ]; then
+    git -C "$ROOT" fetch --quiet origin "$HEAD_REF" 2>/dev/null || true
+fi
 git -C "$ROOT" rev-parse --verify --quiet "${HEAD_OID}^{commit}" >/dev/null \
     || die "head commit $HEAD_OID is not local after fetch — rerun"
 git -C "$ROOT" worktree add --quiet --detach "$WT" "$HEAD_OID" || die "worktree add failed for $HEAD_OID"
 echo "== worktree: $WT"
 
-SCRIPT_ID="$(sha256sum "$WT/scripts/pr-verify.sh" 2>/dev/null | cut -c1-12)"
+# Provenance hashes the EXECUTING script ($0 at invocation time), never the
+# worktree copy — a PR that modifies the verifier must not stamp itself.
+SCRIPT_ID="$(sha256sum "$INVOKED_AS" 2>/dev/null | cut -c1-12)"
 HOST="$(hostname -s 2>/dev/null || echo unknown)"
 
 leg_names=() leg_status=() leg_detail=() leg_secs=()
@@ -135,10 +168,12 @@ run_hygiene() {
 run_deps() {
     echo "== leg: deps"
     local t=$SECONDS log="$LOGDIR/deps.log"
-    if npm ci >>"$log" 2>&1; then
-        record deps PASS "npm ci" $((SECONDS - t))
+    # --ignore-scripts (#3 P1): never execute PR-controlled lifecycle code
+    # (prepare et al.) during install; the compile legs run tsc explicitly.
+    if npm ci --ignore-scripts >>"$log" 2>&1; then
+        record deps PASS "npm ci --ignore-scripts" $((SECONDS - t))
     else
-        record deps FAIL "npm ci failed — see deps.log" $((SECONDS - t))
+        record deps FAIL "npm ci --ignore-scripts failed — see deps.log" $((SECONDS - t))
     fi
 }
 
@@ -216,7 +251,7 @@ compose_comment() {
             echo "### Local CI gate — ref \`${HEAD_REF}\`"
             echo
         fi
-        echo "Run of \`scripts/pr-verify.sh\` (fleet pattern: Amperstrand/.github \`workflow-templates/local-ci-gate.md\` — GitHub Actions is org-blocked, so this comment is the offline verification evidence, produced on the pinned head SHA)."
+        echo "Run of \`scripts/pr-verify.sh\` (fleet pattern: Amperstrand/.github \`workflow-templates/local-ci-gate.md\` — GitHub Actions is org-blocked, so this comment is the offline verification evidence, produced on the pinned head SHA). **Trust assumption:** legs execute PR-controlled code on the verifying host; this run is only valid for trusted authors (gate enforced at start)."
         echo
         echo "- **Head:** \`${HEAD_REF}\` @ \`${HEAD_OID:0:10}\`"
         [ -n "$PR_NUMBER" ] && echo "- **Base:** \`main\` @ \`${BASE_SHA:0:10}\`"
